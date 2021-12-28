@@ -1,0 +1,969 @@
+---
+title: "STA 9750 Final Project"
+author: "Uros Trifunovic, Mehdi Lahlou Charki, Udit Bhandari"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: 3
+subtitle: Analysis of the YouTube Videos Trending in the United States
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = FALSE,
+	message = FALSE,
+	warning = FALSE
+)
+options(digits = 2)
+
+comma <- function(x) {
+  format(x, digits = 2, big.mark = ",")
+}
+
+require(dplyr); require(tidyverse); require(ggplot2); require(tm);
+require(rjson); require(lubridate); require(gridExtra); library(modelr);
+require(randomForest); require(kableExtra); require(wordcloud);
+```
+
+```{r load data, include=FALSE}
+# Load the data from the csv file
+yt_vids_us <- read_csv('Kaggle data/archive/USvideos.csv')
+
+# The video categories are located in a separate JSON file
+yt_vids_us_json <- fromJSON(file = 'Kaggle data/archive/US_category_id.json')
+
+# Read in the JSON data
+json_data_frame <- as.data.frame(yt_vids_us_json)
+```
+
+```{r parse json, include=FALSE}
+# Create a data frame to store categories mapping 
+yt_vids_categories <- data.frame()
+
+# Get the categories mapping from the JSON file
+for (item in 1:length(yt_vids_us_json[['items']])){
+  id <- print(yt_vids_us_json[['items']][[item]]['id'])
+  category <- print(yt_vids_us_json[['items']][[item]]['snippet'][[1]]['title'])
+  
+  yt_vids_categories <- yt_vids_categories %>% rbind(c(id, category))
+}
+
+# Rename the columns to match the format of the main data set
+colnames(yt_vids_categories) <- c('category_id', 'category_title')
+
+# 'category_id' is of a character type but contains only numbers
+# We convert the column to 'double' 
+yt_vids_categories$category_id <- as.double(yt_vids_categories$category_id)
+
+# Save output
+write_csv(yt_vids_categories, 'Formatted data/categories.csv')
+```
+
+```{r inspect and organize data, include=FALSE}
+# There are 40,949 rows and 16 columns in the dataset
+dim(yt_vids_us)
+
+# Get familiar with the column data types
+str(yt_vids_us)
+
+# Check the number of missing values per column
+colSums(is.na(yt_vids_us))
+
+# The 'trending_date' column is of a string type although it contains dates
+# We convert the columns type to date 
+yt_vids_us$trending_date <- format(
+  as.Date(yt_vids_us$trending_date, "%y.%d.%m"), "%m/%d/%y"
+)
+
+# There are only category ids in the data set but no category titles and it is
+# hard to say what category a video belongs to based on the id alone
+# We map the category ids in the main data set with the corresponding titles
+yt_vids_us <- yt_vids_us %>% left_join(yt_vids_categories) 
+
+# Confirm the mapping is correct
+yt_vids_us %>% select(category_id, category_title)
+
+# Rename the "Howto & Style" values in the category_title column
+yt_vids_us$category_title[yt_vids_us$category_title == 'Howto & Style'] <- 'How To & Style'
+
+# Store the count of initially missing values
+initially_missing <- round(mean(is.na(yt_vids_us)) * 100, 2)
+
+# Remove the columns we are not interested in
+yt_vids_us <- yt_vids_us %>% 
+  select(-c('category_id', 'thumbnail_link', 'description'))
+
+# Confirm there are no missing values in the dataset anymore
+colSums(is.na(yt_vids_us))
+
+# Examine first few rows
+yt_vids_us %>% head() 
+
+# Confirm all the columns got imported
+yt_vids_us %>% names()
+
+# Confirm the min and max number of views align with the data source
+summary(yt_vids_us$views)
+
+# Look at the the distribution of the views
+quantile
+
+# Save the output
+write_csv(yt_vids_us, 'Formatted data/yt_vids_us.csv')
+```
+<p>&nbsp;</p>
+<p>&nbsp;</p>
+## Introduction
+<p>&nbsp;</p>
+### Project description
+
+YouTube uses factors including but not limited to the number of views, comments, and likes to determine which videos a wide range of viewers would find interesting. These videos are listed as "Trending" and pushed to the platform users. The list gets updated roughly every 15 minutes.  
+
+The analysis looks into the trending YouTube videos in the United States to determine the factors that influence a video's popularity the most. Furthermore, it attempts to construct a model for predicting the number of views for the videos trending in the United States.  We begin by exploring the relationship between the number of views and continuous variables like likes, dislikes, and comments. Next, we analyze the categorical variables such as channel, category, and tags to determine if they increase the chances of getting more views. Lastly, we look into the publishing times to see if posting a video at a particular time of the day is favorable for getting more views on a video.
+The data was obtained from [kaggle.com](https://www.kaggle.com/datasnaek/youtube-new). 
+<p>&nbsp;</p>
+### Dataset overview
+ 
+Initially, a total of `r initially_missing`% of the dataset had missing values, all of which were in the "Description" column. Due to a relatively low proportion of missing values and the irrelevance of the "Description" column for the analysis, we chose to ignore them. Additionally, the "Category ID" and "Category Title" columns contained the same information. Hence, we dropped the former to avoid redundancy as the latter was descriptive. Lastly, we removed the "Thumbnail Link" column as we were not interested in it, either. Upon cleaning the data, we are left with a dataset consisting of `r comma(dim(yt_vids_us)[1])` rows, `r dim(yt_vids_us)[2]` columns, and no missing values.
+
+The dataset provides information on, including but not limited to, the number of views and likes videos had, video creators, tags, and the date they went trending. The overview of the Trending YouTube videos in the United States dataset is below:
+
+```{r data head table, echo=FALSE}
+data_head <- yt_vids_us %>% 
+  select(
+    title, channel_title, category_title, views, 
+    likes, dislikes, comment_count, trending_date
+    ) %>% 
+  head(5)
+
+data_head_table <- knitr::kable(
+  data_head, caption = "Sample data from select columns",
+  col.names = c(
+    'Title', 'Channel', 'Category', 'Views', 
+    'Likes', 'Dislikes', 'Comment count', 'Trending date'
+    ),
+  format.args = list(big.mark = ',', scientific = FALSE)
+)
+
+data_head_table %>% kable_styling(full_width = T)
+```
+
+---
+
+## Continuous variables analysis
+<p>&nbsp;</p>
+### Attribute frequency distribution
+
+We begin the analysis by exploring the relationship views have with likes, dislikes, and comments, as these variables are likely to influence the number of times a video gets seen.
+Looking at the distribution of the views, dislikes, likes, and comments, we observe that the values in the 99th percentile are significantly lower compared to the ones in the 100th percentile. The observation indicates that user engagement is concentrated on the small number of videos, meaning that our dataset contains outliers. 
+
+```{r quantiles table, echo=FALSE}
+Views <- quantile(yt_vids_us$views, c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1))
+Dislikes <- quantile(yt_vids_us$dislikes, c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1))
+Likes <- quantile(yt_vids_us$likes, c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1))
+`Comment Count` <- quantile(yt_vids_us$comment_count, c(0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 1))
+
+quantiles_df <- as.data.frame(rbind(Views, Dislikes, Likes, `Comment Count`))
+
+quantiles_table <- knitr::kable(
+  quantiles_df, caption = "Views, dislikes, likes, and comment count distribution",
+  format.args = list(big.mark = ',', scientific = FALSE)
+)
+
+quantiles_table %>% kable_styling(full_width = F)
+```
+
+<p>&nbsp;</p>
+The frequency distribution plots confirm that most videos have a low number of likes, dislikes, and commentaries. It appears that there are trending videos that do extremely well while the majority get a fraction of their performance.
+<p>&nbsp;</p>
+##### Dislikes, likes, and comments frequency distributions
+
+```{r dist plot, echo=FALSE, fig.align='center', fig.width=10}
+views_dislikes_freq <- yt_vids_us %>% 
+  filter(views <= 30000000 & dislikes <= 20000) %>%
+  ggplot(aes(dislikes/1000)) +
+  geom_histogram(aes(fill = ..count..), bins = 40, show.legend = F) +
+  scale_x_continuous(
+    breaks = seq(0, 10, 2),
+    limits=c(0, 10)
+    ) +
+  scale_fill_gradient(high =  "#E31A1C", low = "#FB9A99") +
+  labs(x = 'Dislikes (in thousands)') +
+  labs(y = 'Frequency') +
+  labs(title = 'Dislikes Frequency') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/freq_dislikes.pdf')
+
+views_likes_freq <- yt_vids_us %>% 
+  filter(views <= 30000000 & likes <= 950000) %>%
+  ggplot(aes(likes/1000)) +
+  geom_histogram(aes(fill = ..count..), bins = 40, show.legend = F) +
+  scale_x_continuous(
+    breaks = seq(0, 500, 100),
+    limits=c(0, 500)
+    ) +
+  scale_fill_gradient(high =  "#33A02C", low = "#B2DF8A") +
+  labs(x = 'Likes (in thousands)') +
+  labs(y = 'Frequency') +
+  labs(title = 'Likes Frequency') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/freq_likes.pdf')
+
+views_comments_freq <- yt_vids_us %>% 
+  filter(views <= 30000000 & comment_count <= 101000) %>%
+  ggplot(aes(comment_count/1000)) +
+  geom_histogram(aes(fill = ..count..), bins = 40, show.legend = F) +
+  scale_x_continuous(
+    breaks = seq(0, 50, 10),
+    limits=c(0, 50)
+    ) +
+  scale_fill_gradient(high =  "#1F78B4", low = "#A6CEE3") +
+  labs(x = 'Comments (in thousands)') +
+  labs(y = 'Frequency') +
+  labs(title = 'Comments Frequency') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/freq_comments.pdf')
+
+grid.arrange(
+  views_dislikes_freq, views_likes_freq, views_comments_freq, 
+  nrow = 1, ncol = 3
+  )
+```
+
+<p>&nbsp;</p>
+### Plotting the relationships
+
+We plot the top three most important variables against views. The plots reveal a few interesting points:  
+
+*  Getting dislikes is very beneficial for increasing the number of views a video gets. Up to ~400,000 dislikes, the slope of the linear relationship between dislikes and view count is very steep. However, once a video reaches ~750,000 dislikes, the relationship becomes negative. It is possible that such videos get out of Trending or that YouTube stops pushing them to the platform users.
+*  The number of likes has a strong linear relationship with the number of views. Generally, a user can expect the views count to increase as the likes count rises throughout the life of a video.  
+*  Receiving comments on videos increases the view count up until a video reaches ~500,000 commentaries. Beyond that point, the increase in view count slows down. The relationship eventually inverses. 
+*  The majority of videos have a low number of likes, dislikes, and commentaries confirming the presence of outliers that the user engagement revolves around.
+<p>&nbsp;</p>
+
+##### Views relationship with dislikes, likes, and comments
+
+```{r cont vars plot, echo=FALSE, fig.align='center', fig.width=10}
+views_dislikes <- yt_vids_us %>% 
+  ggplot(aes(dislikes/1000, views/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#E31A1C", low = "#FB9A99" ) +
+  geom_smooth(color = "#E31A1C", se = F, show.legend = F) +
+  labs(x = 'Dislikes (in thousands)') +
+  labs(y = 'Views (in millions)') +
+  labs(title = 'Views vs. Dislikes') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/views_vs_dislikes.pdf')
+
+views_likes <- yt_vids_us %>% 
+  ggplot(aes(likes/1000, views/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#33A02C", low = "#B2DF8A") +
+  geom_smooth(color = "#33A02C", se = F, show.legend = F) +
+  labs(x = 'Likes (in thousands)') +
+  labs(y = 'Views (in millions)') +
+  labs(title = 'Views vs. Likes') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/views_vs_likes.pdf')
+
+views_comments <- yt_vids_us %>% 
+  ggplot(aes(comment_count/1000, views/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#1F78B4", low = "#A6CEE3") +
+  geom_smooth(color = "#1F78B4", se = F, show.legend = F) +
+  labs(x = 'Commments (in thousands)') +
+  labs(y = 'Views (in millions)') +
+  labs(title = 'Views vs. Comments') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/views_vs_comments.pdf')
+
+grid.arrange(
+  views_dislikes, views_likes, views_comments, 
+  nrow = 1, ncol = 3
+  )
+```
+
+<p>&nbsp;</p>
+### Fitting a linear model
+
+```{r split data, echo=FALSE}
+yt_videos_train_indices <- sample(1:nrow(yt_vids_us), 0.8 * nrow(yt_vids_us))
+yt_videos_train <- yt_vids_us %>% slice(yt_videos_train_indices)
+yt_videos_test <- yt_vids_us %>% slice(-yt_videos_train_indices)
+
+write_csv(yt_videos_train, 'Formatted data/yt_videos_train.csv')
+write_csv(yt_videos_test, 'Formatted data/yt_videos_test.csv')
+```
+
+Considering the linear relationship views have with dislikes, likes, and comments up to a certain point, we fit a linear model using these attributes as predictors. We split the dataset into training and test components using an 80/20 split. Then, we fit the model on the training set using the following formula: 
+<p>&nbsp;</p>
+<center> $Views \sim Likes + Dislikes + Comment  Count$ </center>
+
+<p>&nbsp;</p>
+### Linear model output
+
+```{r fit lm, echo=FALSE}
+yt_vids_lm <- readRDS('Models/yt_vids_lm.rds')
+#yt_vids_lm <- lm(views ~ likes + dislikes + comment_count, data = yt_videos_train)
+
+r_sq <- summary(yt_vids_lm)$r.squared
+adj_r_sq <- summary(yt_vids_lm)$adj.r.squared
+coef_dislikes <- coef(summary(yt_vids_lm))["dislikes","Estimate"]
+coef_likes <- coef(summary(yt_vids_lm))["likes","Estimate"]
+coef_comments <- coef(summary(yt_vids_lm))["comment_count","Estimate"]
+rmse_lm <- rmse(yt_vids_lm, yt_videos_test)
+
+lm_model_summary <- as.data.frame(xtable::xtable(summary(yt_vids_lm)))
+rownames(lm_model_summary) <- c('(Intercept)', 'Likes',
+                                'Dislikes', 'Comment Count')
+
+lm_model_summary <- knitr::kable(
+  lm_model_summary, caption = "Linear model summary",
+  format.args = list(big.mark = ',', scientific = F),
+  digits = 2
+)
+
+#saveRDS(yt_vids_lm, 'Models/yt_vids_lm.rds')
+```
+
+The summary table of the linear model output shows the following:
+
+*  p-value for all three variables is below 0.05, indicating their importance for predicting the number of views.
+*  Each dislike is expected to generate ~`r round(coef_dislikes, 0)` additional views.
+*  Each like results in ~`r round(coef_likes, 0)` more views.
+*  The coefficient for the comment count predictor is negative. As previously shown, the relationship between views and the number of comments starts positively but inverses eventually.
+*  Likes have the lowest standard error and the highest t-value, indicating that likes could be the most reliable predictor for the number of views out of the three variables used.
+
+`r lm_model_summary %>% kable_styling(full_width = F)`
+
+The R-squared value of `r r_sq` means that variation in the number of dislikes, likes, and comments can explain ~`r round(r_sq * 100, 2)`% of the variation in the view count. Additionally, the Root Mean Squared Error of the linear model on the test set is `r comma(rmse_lm)`. 
+<p>&nbsp;</p>
+The residuals plots show some large residuals among all three predictors. Furthermore, there is a pattern within "Likes" that our model fails to capture.
+<p>&nbsp;</p>
+##### Dislikes, likes, and comments residuals
+```{r resids plot, echo=FALSE, fig.align='center', fig.width=10}
+yt_videos_test <- yt_videos_test %>%
+  add_residuals(yt_vids_lm)
+
+resids_dislikes <- yt_videos_test %>% 
+  ggplot(aes(dislikes/1000, resid/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#E31A1C", low = "#FB9A99" ) +
+  labs(x = 'Dislikes (in thousands)') +
+  labs(y = 'Residuals (in millions)') +
+  labs(title = 'Residuals vs. Dislikes') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/resids_dislikes.pdf')
+
+resids_likes <- yt_videos_test %>% 
+  ggplot(aes(likes/1000, resid/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#33A02C", low = "#B2DF8A") +
+  labs(x = 'Likes (in thousands)') +
+  labs(y = 'Residuals (in millions)') +
+  labs(title = 'Residuals vs. Likes') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/resids_likes.pdf')
+
+resids_comments <- yt_videos_test %>% 
+  ggplot(aes(comment_count/1000, resid/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F) +
+  scale_fill_gradient(high = "#1F78B4", low = "#A6CEE3") +
+  labs(x = 'Commments (in thousands)') +
+  labs(y = 'Residuals (in millions)') +
+  labs(title = 'Residuals vs. Comments') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/resids_comments.pdf')
+
+grid.arrange(
+  resids_dislikes, resids_likes, resids_comments, 
+  nrow = 1, ncol = 3
+  )
+```
+
+<p>&nbsp;</p>
+### Plotting the normalized relationships
+
+As the plots show, the relationship views have with dislikes, likes, and comment count is skewed. To transform skewed data to approximately conform to normality, we use the log transformation. The plots reveal that the log-transformation makes the patterns more linear.
+<p>&nbsp;</p>
+##### Normalized views relationship with dislikes, likes, and comments 
+
+```{r log cont vars plot, echo=FALSE, fig.align='center', fig.width=10}
+yt_vids_us_log <- yt_vids_us %>%
+  mutate(
+    lviews = log2(views + 1),
+    llikes = log2(likes + 1),
+    ldislikes = log2(dislikes + 1),
+    lcomments = log2(comment_count + 1)
+  )
+
+views_dislikes_log <- yt_vids_us_log %>%
+  ggplot(aes(ldislikes, lviews)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#E31A1C", low = "#FB9A99" ) +
+  geom_smooth(color = "#E31A1C", se = F, show.legend = F) +
+  labs(x = 'log(Dislikes)') +
+  labs(y = 'log(Views)') +
+  labs(title = 'log(Views) vs. log(Dislikes)') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/views_vs_dislikes_log.pdf')
+
+views_likes_log  <- yt_vids_us_log %>%
+  ggplot(aes(llikes, lviews)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#33A02C", low = "#B2DF8A") +
+  geom_smooth(color = "#33A02C", se = F, show.legend = F) +
+  labs(x = 'log(Likes)') +
+  labs(y = 'log(Views)') +
+  labs(title = 'log(Views) vs. log(Likes)') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/views_vs_likes_log.pdf')
+
+views_comments_log  <- yt_vids_us_log %>%
+  ggplot(aes(lcomments, lviews)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#1F78B4", low = "#A6CEE3") +
+  geom_smooth(color = "#1F78B4", se = F, show.legend = F) +
+  labs(x = 'log(Commments)') +
+  labs(y = 'log(Views)') +
+  labs(title = 'log(Views) vs. log(Commments)') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/views_vs_comments_log.pdf')
+
+grid.arrange(
+  views_dislikes_log ,views_likes_log, views_comments_log,
+  nrow = 1, ncol = 3
+)
+```
+
+<p>&nbsp;</p>
+### Fitting the normalized linear model
+
+```{r split log data, echo=FALSE}
+yt_videos_train_log <- yt_vids_us_log %>% slice(yt_videos_train_indices)
+yt_videos_test_log <- yt_vids_us_log %>% slice(-yt_videos_train_indices)
+
+write_csv(yt_videos_train, 'Formatted data/yt_videos_train_log.csv')
+write_csv(yt_videos_test, 'Formatted data/yt_videos_test_log.csv')
+```
+
+Next, we fit a linear model on the training set using the log-transformed predictors. The model is fitted with the following formula:
+<p>&nbsp;</p>
+<center> $log(Views) \sim log(Likes) + log(Dislikes) + log(Comment  Count)$ </center>
+
+<p>&nbsp;</p>
+### Normalized linear model output
+
+```{r fit log lm, echo=FALSE}
+yt_vids_lm_log <- lm(lviews ~ llikes + ldislikes + lcomments, data = yt_videos_train_log)
+
+r_sq_log <- summary(yt_vids_lm_log)$r.squared
+adj_r_sq_log <- summary(yt_vids_lm_log)$adj.r.squared
+coef_dislikes_log <- coef(summary(yt_vids_lm_log))["ldislikes","Estimate"]
+coef_likes_log <- coef(summary(yt_vids_lm_log))["llikes","Estimate"]
+coef_comments_log <- coef(summary(yt_vids_lm_log))["lcomments","Estimate"]
+p_comments_log <- coef(summary(yt_vids_lm_log))["lcomments","Pr(>|t|)"]
+
+yt_videos_test_log <- yt_videos_test_log %>%
+  add_residuals(yt_vids_lm_log, "lresid") %>%
+  add_predictions(yt_vids_lm_log, "lviews") %>%
+  mutate(
+    resid = (2 ^ lresid) - 1,
+    pred_views = (2 ^ lviews) - 1
+    )
+
+rmse_lm_log <- sqrt(mean((yt_videos_test_log$pred_views - yt_videos_test_log$views)^2))
+
+lm_model_summary_log <- as.data.frame(xtable::xtable(summary(yt_vids_lm_log)))
+rownames(lm_model_summary_log) <- c('(Intercept)', 'Likes',
+                                'Dislikes', 'Comment Count')
+
+lm_model_summary_log <- knitr::kable(
+  lm_model_summary_log, caption = "Linear model summary",
+  format.args = list(big.mark = ',', scientific = F),
+  digits = 2
+)
+```
+
+The R-squared value of `r r_sq_log` shows that the log-transformed linear model is slightly more accurate than the initial one. The RMSE of the log-transformed model is `r comma(rmse_lm_log)` compared to `r comma(rmse_lm)` of the earlier model.
+
+`r lm_model_summary_log %>% kable_styling(full_width = F)`
+
+<p>&nbsp;</p>
+##### Normalized dislikes, likes, and comments residuals
+
+The initial linear model residuals' plots have earlier revealed that there are some patterns the model fails to capture. We look at the log model residuals to see if the log-transformation took care of the problem. We back transform the residuals and plot them to see how their distribution.
+
+```{r log resids plot, echo=FALSE, fig.align='center', fig.width=10}
+resids_dislikes_log <- yt_videos_test_log %>% 
+  ggplot(aes(dislikes/1000, resid/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#E31A1C", low = "#FB9A99" ) +
+  labs(x = 'Dislikes (in thousands)') +
+  labs(y = 'Residuals (in millions)') +
+  labs(title = 'Residuals vs. Dislikes') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/resids_dislikes_log.pdf')
+
+resids_likes_log <- yt_videos_test_log %>% 
+  ggplot(aes(likes/1000, resid/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F)+
+  scale_fill_gradient(high = "#33A02C", low = "#B2DF8A") +
+  labs(x = 'Likes (in thousands)') +
+  labs(y = 'Residuals (in millions)') +
+  labs(title = 'Residuals vs. Likes') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/resids_likes_log.pdf')
+
+resids_comments_log <- yt_videos_test_log %>% 
+  ggplot(aes(comment_count/1000, resid/1000000)) +
+  geom_hex(bins = 25, color = "white", show.legend = F) +
+  scale_fill_gradient(high = "#1F78B4", low = "#A6CEE3") +
+  labs(x = 'Commments (in thousands)') +
+  labs(y = 'Residuals (in millions)') +
+  labs(title = 'Residuals vs. Comments') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/resids_comments_log.pdf')
+
+grid.arrange(
+  resids_dislikes_log, resids_likes_log, resids_comments_log,
+  nrow = 1, ncol = 3
+)
+```
+
+With most of the residuals concentrated around 0, we confirm that the normalized linear model is a better predictor of video view count than the initial one. However, there still are some values with large residuals. To gain a better understanding of other factors impacting video popularity we turn our focus to tags next.
+
+---
+
+## Categorical variables analysis
+<p>&nbsp;</p>
+### Tags analysis
+```{r pct entertainment, echo=FALSE}
+pct_ent <- yt_vids_us %>% 
+  filter(category_title == 'Entertainment') %>% 
+  nrow() / nrow(yt_vids_us)
+```
+YouTube tags are words and phrases used to give YouTube context about a video. They are an important ranking factor in YouTube's search algorithm. The word cloud below summarizes the tags most frequently used among the videos trending in the United States in 2017 and 2018.
+
+Content creators repeatedly used tags like "funny" and "comedy", suggesting dominance of the entertainment videos among the trending ones. The observation makes sense as videos from this category are `r round(pct_ent * 100,2)`% of the dataset. The "how to", "music", and "pop" videos get a relatively large number of views, too.
+
+```{r tags df & word cloud, fig.align='center', echo=FALSE}
+all_tags <- tolower(yt_vids_us$tags)
+all_tags <- gsub("^[ ]+", "", gsub("[^a-z|]+", " ", all_tags))
+all_tags <- paste(all_tags, collapse = "|") 
+all_tags <- str_trim(unlist(strsplit(all_tags, split = '\\|'))) 
+
+keep_words <- c('2017', '2018', 'how', 'to')
+stop_words <- setdiff(stopwords('english'), keep_words)
+
+all_tags <- removeWords(all_tags, stop_words)
+all_tags <- all_tags[!(is.na(all_tags) | all_tags == "" | all_tags == " " | all_tags == "none")]
+all_tags <- str_trim(all_tags)
+all_tags_tab <- as_tibble(sort(xtabs(~all_tags), decreasing = TRUE))
+all_tags_tab <- all_tags_tab %>% filter(!(is.na(all_tags) | all_tags == "" | all_tags == " "))
+
+top_500tags <- all_tags_tab[1:500, ]
+
+wordcloud(
+  words = top_500tags$all_tags, freq = top_500tags$n, min.freq = 1,
+  max.words=500, random.order=F, rot.per=0.35, colors=brewer.pal(8, "Paired")
+)
+
+write_csv(all_tags_tab, 'Formatted data/all_tags.csv')
+write_csv(top_500tags, 'Formatted data/top500_tags.csv')
+```
+
+<p>&nbsp;</p>
+### Fitting the Random Forest model
+
+To gain insight into which tags are the most important for a video to generate more views, we fit a Random Forest model. We focus on the channel, category, and the top 500 most frequently used tags for which we add a logical column to the dataset for each. The values in the columns are "TRUE" if the phrase appears within the video tags, otherwise "FALSE". Then, we fit the Random Forest model on the training set using the following formula:
+<p>&nbsp;</p>
+<center> $Views \sim Channel + Category + Top500MostFrequentTags$ </center>
+
+<p>&nbsp;</p>
+
+```{r enrich dataset with tags, echo=FALSE}
+#for (tag in top_500tags %>% pull(all_tags)) {yt_vids_us <- yt_vids_us %>% mutate(!!tag := grepl(tag, tags))}
+
+#write_csv(yt_vids_us, 'Formatted data/yt_vids_us_enriched_tags.csv')
+yt_vids_us <- read_csv('Formatted data/yt_vids_us_enriched_tags.csv')
+```
+
+```{r prep rf data, echo=FALSE}
+yt_videos_train <- yt_vids_us %>% slice(yt_videos_train_indices)
+yt_videos_test <- yt_vids_us %>% slice(-yt_videos_train_indices)
+
+# rf_data_train <- yt_videos_train %>% select(views, channel_title, category_title, last_col(0:499))
+# colnames(rf_data_train) <- str_replace_all(colnames(rf_data_train), ' ', '_')
+# 
+# rf_data_test <- yt_videos_test %>% select(views, channel_title, category_title, last_col(0:499))
+# colnames(rf_data_test) <- str_replace_all(colnames(rf_data_test), ' ', '_')
+# 
+# write_csv(rf_data_train, 'Formatted data/rf_data_train.csv')
+# write_csv(rf_data_test, 'Formatted data/rf_data_test.csv')
+
+rf_data_train <- read_csv('Formatted data/rf_data_train.csv')
+rf_data_test <- read_csv('Formatted data/rf_data_test.csv')
+```
+
+```{r fit random forest, include=FALSE}
+yt_vids_tags_rf <- readRDS('Models/yt_vids_tags_rf.rds')
+#yt_vids_tags_rf <- randomForest(views ~ ., data = rf_data_train, 
+#                                importance = TRUE, 
+#                                do.trace = 10, ntree = 500)
+
+num_trees <- yt_vids_tags_rf$ntree
+num_pred_at_node <- yt_vids_tags_rf$mtry
+rf_mse <- yt_vids_tags_rf$mse[num_trees]
+rf_rmse_test <- rmse(yt_vids_tags_rf, rf_data_test)
+rf_rsq <- yt_vids_tags_rf$rsq[num_trees]
+
+#saveRDS(yt_vids_tags_rf, 'Models/yt_vids_tags_rf.rds')
+```
+
+
+### Random Forest model output
+
+The Random Forest model slightly underperforms the linear one when it comes to accuracy with the R-squared value of `r rf_rsq`. The model was fit on `r num_trees` with `r num_pred_at_node` predictors sampled for splitting at each node. Additionally, the Root Mean Squared Error on the test set is `r comma(rf_rmse_test)`.
+
+The importance chart points out a few observations: 
+
+*  Certain channels are likely to get more views on their videos, probably because a large number of subscribers.
+*  The above is strengthened by the presence of "Safiya Nygaard", "Liza Koshy", "Selena Gomez", and "Nikkietutorials" among the top 10 most important categories/channels/tags. Although the owners of the listed channels are not all strictly YouTubers, they split ~67 million subscribers among themselves.  
+*  Videos in particular categories get seen more frequently relative to the others.
+*  Frames per second (fps) is one of the determinants of video quality, hinting that viewers are more likely to re-watch the better quality videos. 
+
+```{r rf imp, echo=FALSE}
+imp_rf_20 <- importance(yt_vids_tags_rf) %>% 
+  as_tibble(rownames = "var") 
+
+imp_rf_20$var <- str_replace(
+  imp_rf_20$var, str_sub(imp_rf_20$var, start = 1, end = 1),
+  toupper(str_sub(imp_rf_20$var, start = 1, end = 1))
+  )
+imp_rf_20$var <- str_replace_all(imp_rf_20$var, "_", " ")
+```
+
+<p>&nbsp;</p>
+##### Top 10 most important variables among channel, category, and tags
+```{r plot imp, echo=FALSE, fig.align='center', fig.width=10, fig.height=3}
+plot_imp_mse <- imp_rf_20 %>%
+  arrange(desc(`%IncMSE`)) %>%
+  head(10) %>%
+  ggplot(aes(reorder(var, `%IncMSE`), `%IncMSE`, fill = `%IncMSE`)) +
+  geom_col(show.legend = F) +
+  scale_fill_gradient2() +
+  labs(y = '% Increase in Mean Squared Error') +
+  labs(x = 'Category / Channel') +
+  labs(title = 'Top 10 most important variables') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12)) +
+  coord_flip()
+
+ggsave('Plots/rf_most_imp_cat.pdf')
+
+plot_imp_mse
+```
+
+---
+
+## Publishing time analysis
+<p>&nbsp;</p>
+### Most popular time of day for publishing
+
+Next, we turn our focus to the time the creators published their videos. We begin by splitting a day into four parts and classify videos based on the publishing time as follows:
+
+*  Videos uploaded between midnight and 6 am we categorize as "Night".
+*  The ones published between 6:01 am and 12 pm fall into the "Morning" group.
+*  Uploads 12:01 pm and 6 pm puts those videos in the "Afternoon" category.
+*  Lastly, videos published 6:01 pm and 11:59 pm are categorized as "Evening".
+
+All the times are expressed in the Coordinated Universal Time (UTC). Per the table, over two-thirds of the trending videos were uploaded in the afternoon and evening hours. Moreover, around 45% of all the videos were published in the afternoon, between 12:01 pm and 6 pm UTC.  
+
+```{r enrich dataset with times, echo=FALSE}
+# breaks_tod <- hour(hm("00:00", "6:00", "12:00", "18:00", "23:59"))
+# labels_tod <- c("Night", "Morning", "Afternoon", "Evening")
+# 
+# yt_vids_us <- yt_vids_us %>%
+#   mutate(
+#     publish_hour = hour(yt_vids_us$publish_time),
+#     publish_tod = cut(publish_hour, breaks = breaks_tod, labels = labels_tod, include.lowest = T)) %>%
+#   group_by(channel_title) %>%
+#   mutate(tot_views = sum(views)) %>%
+#   ungroup()
+# 
+# quantiles <- quantile(yt_vids_us$tot_views, c(0.25, 0.5, 0.75, 1))
+# breaks_size <- c(0, quantiles[1] , quantiles[2], quantiles[3], quantiles[4])
+# labels_size <- c("Small", "Medium", "Big", "Mega")
+# 
+# yt_vids_us <- yt_vids_us %>% mutate(channel_size = cut(yt_vids_us$tot_views, breaks = breaks_size, labels = labels_size, right = T))
+# 
+# write_csv(yt_vids_us, 'Formatted data/yt_vids_us_enriched_times.csv')
+yt_vids_us <- read_csv('Formatted data/yt_vids_us_enriched_times.csv')
+```
+
+```{r tod table, echo=FALSE}
+tod_df <- yt_vids_us %>% group_by(publish_tod) %>% 
+  summarise(
+    count = n(),
+    pct = round(count / nrow(yt_vids_us) * 100, 2)
+  ) %>% 
+  arrange(desc(count))
+
+time_table <- knitr::kable(
+  tod_df, caption = "Videos published by time of day",
+  col.names = c('Time of day', 'Videos', 'Percentage'),
+  format.args = list(big.mark = ',')
+)
+
+time_table %>% kable_styling(full_width = F)
+```
+
+<p>&nbsp;</p>
+### Most popular hours for publishing
+The chart below confirms the claim the afternoon hours are the most popular ones for publishing a video as most videos were uploaded to YouTube between 3-5 pm UTC. Upload frequency decreases after 6 pm UTC and remains low before picking up around noon the following day.
+<p>&nbsp;</p>
+##### Number of videos published by hour
+```{r time plot, echo=FALSE, fig.align='center', fig.width=10}
+time_df <- yt_vids_us %>% group_by(publish_hour) %>% 
+  summarise(
+    count = n(),
+    pct = round(count / nrow(yt_vids_us) * 100,2)
+  ) %>% 
+  arrange(desc(count))
+
+time_df %>% ggplot(aes(publish_hour, count, fill = count)) + geom_col(show.legend = F) + 
+  scale_x_discrete(limits = 0:23) +
+  scale_fill_gradient2() +
+  labs(y = 'Videos') +
+  labs(x = 'Hour') +
+  labs(title = 'Videos published by hour') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12))
+
+ggsave('Plots/videos_published_by_hour.pdf')
+```
+
+<p>&nbsp;</p>
+### Most popular hours for publishing, by category
+We look into the most popular time of day to publish a video for each category. As expected, most video categories have their peak publishing time between 3 pm and 5 pm UTC. However, Music, as the second most popular category, has seen most videos published at 5 am UTC.
+<p>&nbsp;</p>
+##### Number of videos published by hour and video category 
+```{r cat hour plot, echo=FALSE, fig.align='center', fig.width=10}
+cat_plot <- yt_vids_us %>% group_by(category_title, publish_hour) %>% 
+  summarise(n = n()) %>%
+  ggplot(aes(publish_hour, n, color = str_wrap(category_title, 15))) + 
+  geom_path() +
+  geom_point() +
+  scale_x_discrete(limits = 0:23) +
+  scale_fill_gradient2() +
+  labs(y = 'Videos') +
+  labs(x = 'Hour') +
+  labs(title = 'Videos published by hour and category') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12), legend.position = "top", legend.title = element_blank()) +
+  guides(color = guide_legend(nrow = 2, byrow = T))
+
+ggsave('Plots/videos_published_by_hour_cat.pdf')
+
+cat_plot
+```
+
+<p>&nbsp;</p>
+### Most popular hours for publishing, by channel size
+We split the channels by size to see whether more popular channels have different peak publishing time relative to the rest. We split the YouTube channels into four groups based on the total number of views channels have in the following way:
+
+*  "Mega" channels' view count is larger than the 99th percentile.
+*  "Big" channels' have view count between the 75h and 99th percentile.
+*  "Medium" channels' total views are between the 25th and 75th percentile.
+*  "Small" channels' view count is below the 25th percentile.
+  
+It seems that peak posting time doesn't change much based on the channel size as channels of all sizes have their peak publishing time between 3 pm and 5 pm UTC.
+<p>&nbsp;</p>
+##### Number of videos published by hour and channel size
+```{r size hour plot, echo=FALSE, fig.align='center', fig.width=10}
+size_plot <- yt_vids_us %>% group_by(channel_size, publish_hour) %>% 
+  summarise(n = n()) %>%
+  ggplot(aes(publish_hour, n, color = channel_size)) + 
+  geom_path() +
+  geom_point() + 
+  scale_x_discrete(limits = 0:23) +
+  labs(y = 'Videos') +
+  labs(x = 'Hour') +
+  labs(title = 'Videos published by hour and channel size') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12), legend.position = 'top', legend.title = element_blank())
+
+ggsave('Plots/videos_published_by_hour_channel_size.pdf')
+
+size_plot
+```
+
+---
+
+## Putting everything together
+
+<p>&nbsp;</p>
+### Fitting the aggregate Random Forest model
+
+```{r enrich dataset with tod, echo=FALSE}
+#for (tod in yt_vids_us$publish_tod) {yt_vids_us <- yt_vids_us %>% mutate(!!tod := grepl(tod, publish_tod))}
+
+#write_csv(yt_vids_us, 'Formatted data/yt_vids_us_enriched_tod.csv')
+yt_vids_us <- read_csv('Formatted data/yt_vids_us_enriched_tod.csv')
+```
+
+```{r prep final rf data, echo=FALSE}
+# least_imp_300 <- imp_rf_20 %>% arrange(`%IncMSE`) %>% head(300)
+# 
+# copy_vids <- yt_vids_us
+# names(copy_vids) <- str_replace_all(names(copy_vids), ' ', '_')
+# least_imp_300$var <- tolower(str_replace_all(least_imp_300$var, ' ', '_'))
+# 
+# copy_vids <- copy_vids %>% select(-c(least_imp_300$var, video_id, trending_date, title, publish_time, tags, comments_disabled, ratings_disabled, video_error_or_removed, publish_hour, publish_tod, tot_views))
+# 
+# rf_data_train_final <- copy_vids %>% slice(yt_videos_train_indices)
+# rf_data_test_final <- copy_vids %>% slice(-yt_videos_train_indices)
+# 
+# rf_data_train_final$channel_size <- as.character(rf_data_train_final$channel_size)
+# rf_data_test_final$channel_size <- as.character(rf_data_test_final$channel_size)
+# 
+# write_csv(rf_data_train_final, 'Formatted data/rf_data_train_final.csv')
+# write_csv(rf_data_test_final, 'Formatted data/rf_data_test_final.csv')
+
+rf_data_train_final <- read_csv('Formatted data/rf_data_train_final.csv')
+rf_data_test_final <- read_csv('Formatted data/rf_data_test_final.csv')
+```
+
+```{r fit final random forest, include=FALSE}
+yt_vids_rf_final <- readRDS('Models/yt_vids_rf_final.rds')
+#yt_vids_rf_final <- randomForest(views ~ ., data = rf_data_train_final, 
+#                                importance = TRUE, 
+#                                do.trace = 10, ntree = 500)
+
+
+num_trees_final <- yt_vids_rf_final$ntree
+num_pred_at_node_final <- yt_vids_rf_final$mtry
+rf_mse_final <- yt_vids_rf_final$mse[num_trees]
+rf_rmse_test_final <- rmse(yt_vids_rf_final, rf_data_test_final)
+rf_rsq_final <- yt_vids_rf_final$rsq[num_trees]
+
+#saveRDS(yt_vids_rf_final, 'Models/yt_vids_rf_final.rds')
+```
+
+As the final component of our analysis, we fit another Random Forest model on the training set based on the previous observations regarding variable importance. We use likes, dislikes, comment count, top 200 most important variables among category, channel, and tags, as well as publish time of day as determinants to predict the view count for a video. We ignore the hours at which videos were uploaded as those ultimately determine the time of day variable. Therefore, the formula for the final Random Forest model is as follows: 
+<p>&nbsp;</p>
+<center> $Views \sim Likes + Dislikes + Comment Count + Top200MostImportantCategoricalVars + Time Of Day$ </center>
+<p>&nbsp;</p>
+### Aggregate Random Forest model output
+
+The final model noticeably outperforms both the linear model and the earlier Random Forest model. With the R-squared value of `r rf_rsq_final`, the model explains ~`r round(rf_rsq_final * 100, 2)`% of the variation in the view count. Like the previous model, this one was fit on `r num_trees_final` but was sampling `r num_pred_at_node_final`  predictors for splitting at each node. The RMSE on the test set is `r comma(rf_rmse_test_final)`.
+
+The importance chart highlights the following:  
+
+*  Likes, dislikes, and comment count are the most important for determining the video view count.
+*  Entertainment, music, and sports videos get more views than the others .
+*  Although the majority of the creators of the trending videos publish to YouTube in the afternoon hours, it appears that the ones uploaded between midnight and 6 am UTC get the most views. As previously identified, these are most likely Music videos. Viewers are more likely to repeatedly watch music videos when they fall in love with a song.
+*  Viewers enjoy watching trailers for the movies .
+*  YouTube users care about the video quality expressed in the number of frames per second and the slow-motion functionality.
+
+```{r rf imp final, echo=FALSE}
+imp_rf_20_final <- importance(yt_vids_rf_final) %>% 
+  as_tibble(rownames = "var") 
+
+imp_rf_20_final$var <- str_replace(
+  imp_rf_20_final$var, str_sub(imp_rf_20_final$var, start = 1, end = 1),
+  toupper(str_sub(imp_rf_20_final$var, start = 1, end = 1))
+  )
+imp_rf_20_final$var <- str_replace_all(imp_rf_20_final$var, "_", " ")
+```
+
+<p>&nbsp;</p>
+##### Top 20 most important variables among channel, category, and tags
+
+```{r plot imp final, echo=FALSE, fig.align='center', fig.width=10, fig.height=4}
+plot_imp_mse_final <- imp_rf_20_final %>%
+  arrange(desc(`%IncMSE`)) %>%
+  head(20) %>%
+  ggplot(aes(reorder(var, `%IncMSE`), `%IncMSE`, fill = `%IncMSE`)) +
+  geom_col(show.legend = F) +
+  scale_fill_gradient2() +
+  labs(y = '% Increase in Mean Squared Error') +
+  labs(x = 'Category / Channel') +
+  labs(title = 'Top 20 most important variables') +
+  theme_minimal(base_family = 'Times') +
+  theme(plot.title = element_text(size = 12)) +
+  coord_flip()
+
+ggsave('Plots/rf_most_imp_final.pdf')
+
+plot_imp_mse_final
+```
+
+<p>&nbsp;</p>
+### Model comparison
+
+In summary, we compare the four models to see which one is best for predicting the view count for YouTube Trending videos. We look into the accuracy of the linear model fitted on the continuous variables ("Linear (cont)"), the log-transformed linear model ("Linear (log)"), the Random Forest model fitted on the select categorical variables ("Random Forest (cat)"), and the Random Forest model fitted on the most important continuous and categorical variables ("Random Forest (agg)").   
+<p>&nbsp;</p>
+The results show the following:
+
+*  Out of the four models, Random Forest with a channel, category, and top 500 most frequently used tags as determinants is the worst predictor of a video view count.
+*  The linear model halved the previously-mentioned model's RMSE and has a slightly better R-squared value.
+*  The model with log-transformed variables further improves the R-squared value. However, its RMSE is worse than the initial linear model's.
+*  All three models fall far behind the aggregate Random Forest model. Its R-squared value of `r rf_rsq_final` is substantially higher than those of the other two models. Furthermore, the model's RMSE is ~`r round(rmse_lm / rf_rmse_test_final, 1)`x smaller than that of the linear model, ~`r round(rmse_lm_log / rf_rmse_test_final, 1)`x smaller than that of the normalized linear model, and ~`r round(rf_rmse_test / rf_rmse_test_final, 1)`x smaller than that of the other Random Forest model.
+
+```{r model comp table, echo=FALSE}
+model_comp <- data.frame('Model' = c('Linear (cont)', 'Linear (log)', 'Random Forest (cat)', 'Random Forest (agg)'))
+model_comp <- model_comp %>% cbind('RMSE' = c(rmse_lm, rmse_lm_log, rf_rmse_test, rf_rmse_test_final),
+                     'R-squared' = c(r_sq, r_sq_log, rf_rsq, rf_rsq_final))
+
+model_comp_table <- knitr::kable(
+  model_comp, caption = "Linear vs. Linear log vs. RF Cat vs. RF Agg",
+  format.args = list(big.mark = ',', scientific = FALSE)
+)
+
+model_comp_table %>% kable_styling(full_width = F)
+```
+
+---
+
+## Conclusion and the next steps
+
+<p>&nbsp;</p>
+The analysis shows that even getting dislikes on a video is beneficial for increasing the views count up to a certain point. As expected, more likes lead to more views while the rising comment count eventually stops contributing to getting views. Additionally, there are videos that do exceptionally well. Those are most likely entertainment and music videos. Although the majority of the videos are published in the afternoon, the ones uploaded overnight are more important for predicting the view count. The next step of the analysis could be to narrow its focus to these videos that outperform the others and try to understand the driving forces behind their performance.
+
+---
